@@ -1,0 +1,10 @@
+{
+    "files.insertFinalNewline": true,
+    "editor.inlineSuggest.enabled": false,
+    "black-formatter.args": [
+        "--line-length=120"
+    ],
+    "editor.codeActionsOnSave": {
+        "source.organizeImports": true
+    }
+}
