@@ -21,6 +21,7 @@ lz4 = "^4.4.4"
 autorom = {extras = ["accept-rom-license"], version = "^0.6.1"}
 swig = "^4.3.1.post0"
 py-spy = "^0.4.1"
+seaborn = "^0.13.2"
 
 
 [tool.poetry.group.dev.dependencies]

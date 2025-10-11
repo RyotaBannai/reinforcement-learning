@@ -71,7 +71,6 @@ class Agent:
             dist = Normal(mu, std)
             u = dist.rsample()
             a = torch.tanh(u) * ACTION_SCALE
-
             logp_u = dist.log_prob(u)
             two = torch.tensor(2.0, device=logp_u.device, dtype=logp_u.dtype)
             corr = 2.0 * (torch.log(two) - u - F.softplus(-2.0 * u))
