@@ -15,7 +15,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../../"))
 
 ACTION_SCALE = 1.0
 LOG_SIG_MAX = 2
-LOG_SIG_MIN = -20
+LOG_SIG_MIN = -2
 
 
 # Initialize Policy weights
@@ -37,15 +37,15 @@ class Policy_Network(nn.Module):
             nn.ReLU(),
         )
         self.mean_head = nn.Linear(self.hidden_space2, action_dim)
-        self.std_head = nn.Linear(self.hidden_space2, action_dim)
+        self.log_std_head = nn.Linear(self.hidden_space2, action_dim)
 
         self.apply(weights_init_)
 
     def forward(self, x):
         shared_features = self.shared_net(x.float())
         mu = self.mean_head(shared_features)
-        std = F.softplus(self.std_head(shared_features))
-        std = torch.clamp(std, min=np.exp(LOG_SIG_MIN), max=np.exp(LOG_SIG_MAX))
+        log_std = self.log_std_head(shared_features).clamp(LOG_SIG_MIN, LOG_SIG_MAX)
+        std = log_std.exp()
         return mu, std
 
 
@@ -70,44 +70,32 @@ class Value_Network(nn.Module):
         return val
 
 
-class REINFORCE_baseline:
-    """REINFORCE algorithm."""
+class ActorCritic:
+    """ActorCritic algorithm."""
 
     def __init__(self, obs_space_dims: int, action_space_dims: int):
-        """Initializes an agent that learns a policy via REINFORCE algorithm [1]
-        to solve the task at hand (Inverted Pendulum v4).
-
-        Args:
-            obs_space_dims: Dimension of the observation space
-            action_space_dims: Dimension of the action space
-        """
-
         # Hyperparameters
-        self.learning_rate = 1e-4  # Learning rate for policy optimization
+        self.learning_rate = 3e-4  # Learning rate for policy optimization
         self.gamma = 0.99  # Discount factor
+        self.lamnda = 0.95
         self.eps = 1e-6  # small number for mathematical stability
-
-        self.probs = []  # Stores probability values of the sampled action
-        self.rewards = []  # Stores the corresponding rewards
-        self.obs = []  # Stores observations
 
         self.actor = Policy_Network(obs_space_dims, action_space_dims)
         self.critic = Value_Network(obs_space_dims)
-        self.optimizer_actor = torch.optim.AdamW(self.actor.parameters(), lr=self.learning_rate)
-        self.optimizer_critic = torch.optim.AdamW(self.critic.parameters(), lr=self.learning_rate)
+        self.optimizer_actor = torch.optim.Adam(self.actor.parameters(), lr=self.learning_rate)
+        self.optimizer_critic = torch.optim.Adam(self.critic.parameters(), lr=self.learning_rate)
 
-    def sample_action(self, state: np.ndarray) -> float:
-        """Returns an action, conditioned on the policy and observation.
+        self.init_buffer()
 
-        Args:
-            state: Observation from the environment
+    def init_buffer(self):
+        self.buffer = dict(action=[], prob=[], state=[], reward=[], n_state=[], term=[])
 
-        Returns:
-            action: Action to be performed
-        """
-        state = torch.tensor(np.array([state]))
-        action_means, action_stddevs = self.actor(state)
-        distrib = Normal(action_means[0] + self.eps, action_stddevs[0] + self.eps)
+    def sample_action(self, state: np.ndarray):
+        state = torch.tensor(state)
+        if state.ndim == 1:
+            state = state.unsqueeze(0)  # [N, obs]
+        mu, std = self.actor(state)
+        distrib = Normal(mu, std + self.eps)
         action = distrib.sample()
         prob = distrib.log_prob(action)
         two = torch.tensor(2.0, device=prob.device, dtype=prob.dtype)
@@ -115,84 +103,128 @@ class REINFORCE_baseline:
         prob -= corr
         action = torch.tanh(action) * ACTION_SCALE
         action = action.numpy()
-        self.probs.append(prob)
+        return action, prob
 
-        return action
+    def update(self, n_envs: int):
+        State = torch.tensor(np.array(self.buffer["state"]), dtype=torch.float32)
+        N_state = torch.tensor(np.array(self.buffer["n_state"]), dtype=torch.float32)
+        Prob = torch.stack(self.buffer["prob"]).sum(dim=-1).unsqueeze(1)
+        Reward = torch.tensor(self.buffer["reward"], dtype=torch.float32).unsqueeze(1)
+        Term = torch.tensor(self.buffer["term"], dtype=torch.float32).unsqueeze(1)
 
-    def update(self):
-        """Updates the policy network's weights."""
-        running_g = 0
-        gs = []
-        for R in self.rewards[::-1]:
-            running_g = R + self.gamma * running_g
-            gs.insert(0, running_g)
-        deltas = gs
+        B = State.shape[0]
+        assert B % n_envs == 0, "収集数が n_envs で割り切れません"
+        T = B // n_envs
 
-        obs = torch.tensor(np.array(self.obs), dtype=torch.float)
-        vs = self.critic(obs)
-        v_loss = F.smooth_l1_loss(vs, torch.tensor(deltas).unsqueeze(1))
+        # ----- 形状を [T, n_envs, …] に並べ替え（time-major）-----
+        def time_env(x):
+            # x: [B, *] -> [T, n_envs, *]
+            return x.view(T, n_envs, *x.shape[1:])
 
-        v_baseline = vs.detach()
-        deltas = torch.tensor(np.array(deltas)).unsqueeze(1)
-        adv = deltas - v_baseline
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)  # 正規化
-        log_probs = torch.stack(self.probs).squeeze().sum(dim=-1).unsqueeze(1)  # アクション次元で先に合計
-        policy_loss = (-log_probs * adv).sum()
+        n_Reward = time_env(Reward)
+        n_Term = time_env(Term)
+        n_Prob = time_env(Prob)
+
+        # ----- GAE & 価値ターゲット -----
+        with torch.no_grad():
+            n_V = time_env(self.critic(State))  # [T, n_envs, 1]
+            n_NV = time_env(self.critic(N_state))  # [T, n_envs, 1]
+            not_done = 1.0 - n_Term
+            delta = n_Reward + self.gamma * n_NV * not_done - n_V
+
+            adv = torch.zeros_like(delta)
+            gae: torch.Tensor = torch.zeros((n_envs, 1), dtype=delta.dtype)
+            for t in reversed(range(T)):
+                gae = delta[t] + self.gamma * self.lamnda * not_done[t] * gae
+                adv[t] = gae
+            target = adv + n_V  # λリターン
+            # 標準化＋外れ値クリップ：安定化
+            if B > 1:  # 要素数 1 の正規化回避
+                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            adv = adv.clamp_(-15.0, 15.0)
+
+        vs = self.critic(State)
+        target = target.reshape(B, 1)
+        v_loss = F.smooth_l1_loss(vs, target)
+
+        # State: [B, obs], B=T*n_envs
+        mu, std = self.actor(State)
+        dist = Normal(mu, std.clamp_min(1e-6))
+        ent = dist.entropy().sum(dim=-1, keepdim=True)  # [B,1]
+        ent_t = ent.view(T, n_envs, 1)  # [T, n_envs, 1]
+        entropy_coef = 0.02
+        policy_loss = (-(n_Prob * adv) - entropy_coef * ent_t).mean()
 
         # Update the policy network
         self.optimizer_critic.zero_grad()
         v_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 10.0)
         self.optimizer_critic.step()
         self.optimizer_actor.zero_grad()
         policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
         self.optimizer_actor.step()
 
         # Empty / zero out all episode-centric/related variables
-        self.probs = []
-        self.rewards = []
-        self.obs = []
+        self.init_buffer()
+
+
+# 追加: ベクタ環境用のファクトリ
+def make_env(seed_offset=0):
+    def _thunk():
+        env = gym.make("Hopper-v5")
+        env.reset(seed=seed_offset)  # 各envに違うseedを与える
+        env = gym.wrappers.Autoreset(env)
+        env = gym.wrappers.RecordEpisodeStatistics(env, 50)
+        return env
+
+    return _thunk
 
 
 def train():
-    # Create and wrap the environment
-    env = gym.make("Hopper-v5")
-    wrapped_env = gym.wrappers.RecordEpisodeStatistics(env, 50)  # Records episode-reward
+    n_envs = 8
+    env = gym.vector.SyncVectorEnv([make_env(seed_offset=i) for i in range(n_envs)])
 
     total_num_episodes = int(2e4)  # Total number of episodes
-    obs_space_dims = env.observation_space.shape[0]
-    action_space_dims = env.action_space.shape[0]
+    obs_space_dims = env.single_observation_space.shape[0]
+    action_space_dims = env.single_action_space.shape[0]
     rewards_over_seeds = []
+    T = 128
+    steps_per_update = T * n_envs
 
-    for seed in [1, 2, 3, 5, 8]:  # Fibonacci seeds
+    # for seed in [1, 2, 3, 5, 8]:  # Fibonacci seeds
+    for seed in [1]:
         # set seed
         torch.manual_seed(seed)
         random.seed(seed)
         np.random.seed(seed)
-
-        # Reinitialize agent every seed
-        agent = REINFORCE_baseline(obs_space_dims, action_space_dims)
-        reward_over_episodes = []
+        agent = ActorCritic(obs_space_dims, action_space_dims)
+        collected = 0
 
         for episode in range(total_num_episodes):
-            # gymnasium v26 requires users to set seed while resetting the environment
-            obs, _ = wrapped_env.reset(seed=seed)
+            states, _ = env.reset()
+            for _ in range(T):
+                actions, probs = agent.sample_action(states)
+                n_states, rewards, terms, _, _ = env.step(actions)
+                # バッファへ追加
+                agent.buffer["state"].extend(states.tolist())  # (n_envs, obs_dim)
+                agent.buffer["action"].extend(actions.tolist())  # (n_envs, act_dim) ←今回は未使用でもOK
+                # logpはtensorなので分解して保存
+                agent.buffer["prob"].extend([lp for lp in probs])  # list of tensors（後でstackする）
+                agent.buffer["reward"].extend(rewards.tolist())  # (n_envs,)
+                agent.buffer["n_state"].extend(n_states.tolist())  # (n_envs, obs_dim)
+                agent.buffer["term"].extend(terms.tolist())  # (n_envs,)
 
-            done = False
-            while not done:
-                agent.obs.append(obs)
-                action = agent.sample_action(obs)
-                obs, reward, term, trunc, _ = wrapped_env.step(action)
-                agent.rewards.append(reward)
-                done = term or trunc
+                collected += n_envs
+                states = n_states
 
-            reward_over_episodes.append(wrapped_env.return_queue[-1])
-            agent.update()
+                if len(agent.buffer["state"]) >= steps_per_update:
+                    agent.update(n_envs)
 
-            if episode % 1000 == 0:
-                avg_reward = int(np.mean(wrapped_env.return_queue))
-                print("Episode:", episode, "Average Reward:", avg_reward)
-
-        rewards_over_seeds.append(reward_over_episodes)
+            if episode % 100 == 0:
+                queues = [subenv.return_queue for subenv in env.envs]  # 各 deque
+                avg_latest = np.mean([np.mean(q) for q in queues if len(q) > 0])
+                print("Episode:", episode, "Average Reward:", avg_latest)
 
     df1 = pd.DataFrame(rewards_over_seeds).melt()
     df1.rename(columns={"variable": "episodes", "value": "reward"}, inplace=True)
