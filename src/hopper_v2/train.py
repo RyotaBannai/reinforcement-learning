@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 ACTION_SCALE = 1.0
 
-writer = SummaryWriter("runs/ac_exp5")
+writer = SummaryWriter("runs/ac_exp10")
 
 
 # Initialize Policy weights
@@ -30,16 +30,17 @@ class ActorCritic(nn.Module):
         self.hidden_space2 = 64
         self.actor = nn.Sequential(
             nn.Linear(state_dim, self.hidden_space1),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(self.hidden_space1, self.hidden_space2),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(self.hidden_space2, action_dim),
+            nn.Tanh(),
         )
         self.critic = nn.Sequential(
             nn.Linear(state_dim, self.hidden_space1),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(self.hidden_space1, self.hidden_space2),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(self.hidden_space2, 1),
         )
         self.apply(weights_init_)
@@ -90,15 +91,11 @@ class Agent:
             dist = MultivariateNormal(mu, cov_mat)
             action = dist.sample()
             prob = dist.log_prob(action)
-            two = torch.tensor(2.0, device=prob.device, dtype=prob.dtype)
-            corr = 2.0 * (torch.log(two) - action - F.softplus(-2.0 * action))
-            prob -= corr.sum(dim=-1)
         return action, prob, state_val
 
     def update(self, n_envs: int, step: int):
         OLD_State = torch.tensor(np.array(self.buffer["state"]), dtype=torch.float32)
         OLD_V = torch.tensor(np.array(self.buffer["state_val"]), dtype=torch.float32)
-        OLD_N_state = torch.tensor(np.array(self.buffer["n_state"]), dtype=torch.float32)
         OLD_Action = torch.tensor(self.buffer["action"], dtype=torch.float32)
         OLD_Prob = torch.tensor(self.buffer["prob"], dtype=torch.float32)
         Reward = torch.tensor(self.buffer["reward"], dtype=torch.float32).unsqueeze(1)
@@ -114,48 +111,30 @@ class Agent:
             return x.view(T, n_envs, *x.shape[1:])
 
         n_Reward = time_env(Reward)
-        n_Term = time_env(Term)
-        n_Trunc = time_env(Trunc)
+        n_Done = time_env((Term + Trunc).clamp(max=1.0))  # [T, n_envs, 1]  term or trunc でエピソード終端
 
-        # GAE、価値ターゲット
-        with torch.no_grad():
-            n_V = time_env(OLD_V)
-            _n_NV = time_env(self.policy_old.critic(OLD_N_state))
-            # 1) ブートストラップ用マスク：termだけ0、truncは1
-            m_boot = 1.0 - n_Term
-            # 2) キャリー用マスク：term も trunc も 0（= 境界で GAE を切る）
-            m_carry = 1.0 - torch.clamp(n_Term + n_Trunc, max=1.0)
-            n_NV = _n_NV * m_boot
-            delta = n_Reward + self.gamma * n_NV - n_V
-            # delta = (delta - delta.mean()) / (delta.std() + 1e-7)
+        m_boot = 1.0 - n_Done
+        n_G = torch.zeros_like(n_Reward)  # [T, n_envs, 1]
+        running = torch.zeros((n_envs, 1), dtype=n_Reward.dtype)
+        for t in reversed(range(T)):
+            running = n_Reward[t] + self.gamma * running * m_boot[t]
+            n_G[t] = running
 
-            adv = torch.zeros_like(delta)
-            gae: torch.Tensor = torch.zeros((n_envs, 1), dtype=delta.dtype)
-            for t in reversed(range(T)):
-                gae = delta[t] + self.gamma * self.lamnda * m_carry[t] * gae
-                adv[t] = gae
-            target = adv + n_V  # λリターン
-            # 安定化：標準化＋外れ値クリップ。要素数 1 の正規化は回避
-            if B > 1:
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-            adv = adv.clamp_(-10.0, 10.0)
-
-        # Optimize policy for K epochs
+        n_G = n_G.reshape(B, 1)
+        adv = n_G - OLD_V
+        # n_G = (n_G - n_G.mean()) / (n_G.std() + 1e-7)
         for _ in range(self.K_epochs):
             mu, cov_mat, vs = self.policy(OLD_State)
             dist = MultivariateNormal(mu, cov_mat)
             prob = dist.log_prob(OLD_Action)
-            two = torch.tensor(2.0, device=prob.device, dtype=prob.dtype)
-            corr = 2.0 * (torch.log(two) - OLD_Action - F.softplus(-2.0 * OLD_Action))
-            prob -= corr.sum(dim=-1)
             ent = dist.entropy().mean()
             vs = vs.reshape(B)
             adv = adv.reshape(B)
-            target = target.reshape(B)
+            n_G = n_G.reshape(B)
             ratios = torch.exp(prob - OLD_Prob)
             surr1 = ratios * adv
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * adv
-            loss = (-(torch.min(surr1, surr2))).mean() + 0.5 * self.MseLoss(vs, target) - 0.01 * ent
+            loss = (-(torch.min(surr1, surr2))).mean() + 0.5 * self.MseLoss(vs, n_G) - 0.01 * ent
 
             # Update the policy network
             self.optimizer.zero_grad()
@@ -217,7 +196,7 @@ def train():
     total_num_episodes = int(2e4)  # Total number of episodes
     obs_space_dims = env.single_observation_space.shape[0]
     action_space_dims = env.single_action_space.shape[0]
-    T = 512
+    T = 1024
     steps_per_update = T * n_envs
 
     # for seed in [1, 2, 3, 5, 8]:  # Fibonacci seeds
@@ -233,9 +212,7 @@ def train():
             states, _ = env.reset()
             for _ in range(T):
                 actions, probs, state_vals = agent.sample_action(states)
-                actions_scaled = torch.tanh(actions) * ACTION_SCALE
-                actions_scaled = actions_scaled.numpy()
-                n_states, rewards, terms, truncs, infos = env.step(actions_scaled)
+                n_states, rewards, terms, truncs, infos = env.step(actions.numpy())
 
                 n_state_for_V = n_states.copy()
                 finals = infos.get("final_observation", [None] * n_envs)
