@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import gymnasium as gym
-from train import ACTION_SCALE, PolicyNet
+from train import ACTION_SCALE, Policy_Network
 
 
 # =========================
@@ -13,7 +13,7 @@ def run_eval(actor_ckpt="best_actor.pth", episodes=5, render=False, device="cpu"
     _ = env.reset()
 
     # モデル構築＆ロード
-    policy = PolicyNet(state_dim=11, action_dim=3).to(device)
+    policy = Policy_Network(state_dim=11, action_dim=3).to(device)
     policy.load_state_dict(torch.load(actor_ckpt, map_location=device))
     policy.eval()
 

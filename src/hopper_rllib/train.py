@@ -56,7 +56,7 @@ def main():
 
     save_dir = os.path.abspath("checkpoints")
     os.makedirs(save_dir, exist_ok=True)
-    path = algo.save(save_dir)
+    algo.save(save_dir)
 
     for it in range(1000):
         result = algo.train()
@@ -65,7 +65,7 @@ def main():
         print(f"[Iter {it}] reward_mean={mean_ret:.1f}  ts_total={total_sampled}")
         if mean_ret > best:
             best = mean_ret
-            ret_obj = algo.save(save_dir)
+            algo.save(save_dir)
             print(f"✅ New best ({best:.1f}) saved to: {save_dir}")
 
     # 簡易評価（デモ）
