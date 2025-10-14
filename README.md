@@ -9,6 +9,10 @@ src
 - hopper：
   - 課題：[MuJoCo　Hopper](https://gymnasium.farama.org/environments/mujoco/hopper/)
   - モデル：PPOのゼロ実装（Actor-critic）
+- hopper_v2：
+  - 課題：[MuJoCo　Hopper](https://gymnasium.farama.org/environments/mujoco/hopper/)
+  - モデル：PPOのゼロ実装（Actor-critic）
+  - hopper/の実装内容とほとんど変わらないが、こっちの方が安定していて報酬も倍近い。
 - hopper_rilib：
   - 課題：同上
   - モデル：RLlibを使ったhopperの学習

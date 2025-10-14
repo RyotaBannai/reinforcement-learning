@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 ACTION_SCALE = 1.0
 
-writer = SummaryWriter("runs/ac_exp5")
+writer = SummaryWriter("runs/ac_exp10")
 
 
 # Initialize Policy weights
@@ -21,11 +21,9 @@ def weights_init_(m):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int) -> None:
+    def __init__(self, state_dim: int, action_dim: int, action_std_init) -> None:
         super().__init__()
         self.action_dim = action_dim
-        self.action_std_init = 0.6
-        self.action_var = torch.full((action_dim,), self.action_std_init * self.action_std_init)
         self.hidden_space1 = 64
         self.hidden_space2 = 64
         self.actor = nn.Sequential(
@@ -43,6 +41,7 @@ class ActorCritic(nn.Module):
             nn.Linear(self.hidden_space2, 1),
         )
         self.apply(weights_init_)
+        self.set_action_std(action_std_init)
 
     def forward(self, x):
         mu = self.actor(x.float())
@@ -50,12 +49,13 @@ class ActorCritic(nn.Module):
         state_val = self.critic(x.float())
         return mu, cov_mat, state_val
 
-    # def set_action_std(self, new_action_std):
-    #     self.action_var = torch.full((self.action_dim,), new_action_std * new_action_std)
+    def set_action_std(self, new_action_std):
+        print(f"new_action_std set to: {new_action_std}")
+        self.action_var = torch.full((self.action_dim,), new_action_std * new_action_std)
 
 
 class Agent:
-    def __init__(self, state_dim: int, action_dim: int):
+    def __init__(self, state_dim: int, action_dim: int, action_std: float):
         # Hyperparameters
         self.lr_actor = 0.0003
         self.lr_critic = 0.001
@@ -64,21 +64,37 @@ class Agent:
         self.eps = 1e-6
         self.eps_clip = 0.2
         self.K_epochs = 20
+        self.action_std = action_std
         # Init policy
-        self.policy = ActorCritic(state_dim, action_dim)
+        self.policy = ActorCritic(state_dim, action_dim, self.action_std)
         self.optimizer = torch.optim.Adam(
             [
                 {"params": self.policy.actor.parameters(), "lr": self.lr_actor},
                 {"params": self.policy.critic.parameters(), "lr": self.lr_critic},
             ]
         )
-        self.policy_old = ActorCritic(state_dim, action_dim)
+        self.policy_old = ActorCritic(state_dim, action_dim, self.action_std)
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.MseLoss = nn.MSELoss()
         self.init_buffer()
 
     def init_buffer(self):
         self.buffer = dict(action=[], prob=[], state=[], state_val=[], reward=[], n_state=[], term=[], trunc=[])
+
+    def decay_action_std(self, action_std_decay_rate, min_action_std):
+        print("--------------------------------------------------------------------------------------------")
+        self.action_std -= action_std_decay_rate
+        self.action_std = round(self.action_std, 4)
+        if self.action_std <= min_action_std:
+            self.action_std = min_action_std
+            print(
+                "setting actor output action_std to min_action_std : ",
+                self.action_std,
+            )
+        else:
+            print("setting actor output action_std to : ", self.action_std)
+        self.policy.set_action_std(self.action_std)
+        self.policy_old.set_action_std(self.action_std)
 
     def sample_action(self, state: np.ndarray):
         state = torch.tensor(state)
@@ -175,6 +191,7 @@ class Agent:
         actions_scaled_max = actions_scaled.max(axis=0).values
         actions_scaled_min = actions_scaled.min(axis=0).values
         writer.add_scalars("stats/mu", {f"d{i}": avg_mu[i].item() for i in range(len(avg_mu))}, step)
+        writer.add_scalar("stats/std", self.action_std)
         writer.add_scalars(
             "stats/actions",
             {f"d{i}_mean": actions_scaled_mean[i].item() for i in range(len(actions_scaled_mean))},
@@ -217,8 +234,12 @@ def train():
     total_num_episodes = int(2e4)  # Total number of episodes
     obs_space_dims = env.single_observation_space.shape[0]
     action_space_dims = env.single_action_space.shape[0]
-    T = 512
+    T = 1024
     steps_per_update = T * n_envs
+
+    action_std_decay_rate = 0.05  # linearly decay action_std (action_std = action_std - action_std_decay_rate)
+    min_action_std = 0.1  # minimum action_std (stop decay after action_std <= min_action_std)
+    action_std_decay_freq = n_envs * T * 200  # action_std decay frequency (in num timesteps)
 
     # for seed in [1, 2, 3, 5, 8]:  # Fibonacci seeds
     best_reward = 0
@@ -226,7 +247,7 @@ def train():
         torch.manual_seed(seed)
         random.seed(seed)
         np.random.seed(seed)
-        agent = Agent(obs_space_dims, action_space_dims)
+        agent = Agent(obs_space_dims, action_space_dims, action_std=0.5)
         collected = 0
 
         for episode in range(total_num_episodes):
@@ -263,6 +284,7 @@ def train():
                 if avg_reward > best_reward:
                     best_reward = avg_reward
                     print(f"[Eval] {collected=}, best_reward={avg_reward:.1f}")
+                    torch.save(agent.policy.state_dict(), "best_policy.pth")
 
                 dones = terms | truncs
                 if np.any(dones):
@@ -271,6 +293,9 @@ def train():
                             new_state, _ = env.envs[i].reset()  # その環境だけ更新
                             n_states[i] = new_state
                 states = n_states
+
+            if collected % action_std_decay_freq == 0:
+                agent.decay_action_std(action_std_decay_rate, min_action_std)
 
             if episode % 100 == 0:
                 avg_latest = calc_reward(env)

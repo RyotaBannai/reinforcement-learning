@@ -201,7 +201,7 @@ def train():
                 while not done:
                     with torch.no_grad():
                         mu, _ = agent.pi(torch.tensor(s, dtype=torch.float32).unsqueeze(0))
-                        a = torch.tanh(mu) * ACTION_SCALE  # deterministic
+                        a = torch.tanh(mu) * ACTION_SCALE
                     s, r, term, trunc, _ = env.step(a.numpy().ravel())
                     total += r
                     done = term or trunc
