@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 ACTION_SCALE = 1.0
 
-writer = SummaryWriter("runs/ac_exp10")
+writer = SummaryWriter("runs/ac_exp11")
 
 
 # Initialize Policy weights

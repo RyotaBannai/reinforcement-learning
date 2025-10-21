@@ -25,5 +25,5 @@ src
 poetry install # 初回のみ
 cd src/{各課題フォルダ}
 poetry run python train.py # 学習させる
-poetry run python use_trained_model.py # 学習済みモデルを実行
+poetry run python evaluate.py # 学習済みモデルを実行
 ```

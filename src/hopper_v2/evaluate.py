@@ -44,7 +44,7 @@ def run_eval(actor_ckpt="best_policy.pth", episodes=5, render=False):
 
 if __name__ == "__main__":
     run_eval(
-        actor_ckpt="best_policy.pth",
+        actor_ckpt="./models/best_policy.pth",
         episodes=10,
         render=True,
     )
