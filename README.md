@@ -6,13 +6,18 @@
 
 src
 
+- Amidar：
+  - 課題：[ALE Amidar](https://ale.farama.org/environments/amidar/)
+  - モデル：PPOのゼロ実装（Actor-critic）+ NatureCNN
+  - ベストスコア：555(at 19888 episode/20000)
 - hopper：
   - 課題：[MuJoCo　Hopper](https://gymnasium.farama.org/environments/mujoco/hopper/)
   - モデル：PPOのゼロ実装（Actor-critic）
 - hopper_v2：
   - 課題：[MuJoCo　Hopper](https://gymnasium.farama.org/environments/mujoco/hopper/)
   - モデル：PPOのゼロ実装（Actor-critic）
-  - hopper/の実装内容とほとんど変わらないが、こっちの方が安定していて報酬も倍近い。
+  - ベストスコア：3600 
+  - 備考：hopper/の実装内容とほとんど変わらないが、こっちの方が安定していて報酬も倍近い。
 - hopper_rilib：
   - 課題：同上
   - モデル：RLlibを使ったhopperの学習
